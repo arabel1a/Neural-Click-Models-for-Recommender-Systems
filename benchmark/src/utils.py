@@ -1,0 +1,383 @@
+import torch
+from torch.utils.data import Dataset, DataLoader
+import os
+import pandas as pd
+import numpy as np
+from scipy.sparse import dok_matrix, csr_matrix
+import pickle
+import re
+import gc
+from tqdm.notebook import tqdm
+from copy import deepcopy
+import torch.nn.functional as F
+from torch.nn.utils import clip_grad_norm_
+from sklearn.utils.extmath import randomized_svd
+
+
+from torchmetrics import AUROC, F1Score, Accuracy
+from torchmetrics.functional.classification import binary_f1_score, binary_accuracy
+
+
+def get_dummy_data(d):
+    dummy_loader = torch.utils.data.DataLoader(
+            d,
+            batch_size=2,
+            collate_fn=collate_recommendation_datasets,
+            shuffle=False,
+    )
+    dummy_svd = get_svd_encoder(d, 2)
+    return dummy_loader, dummy_svd
+
+def get_train_val_test_svd(dataset, train_frac=0.8, val_vs_test_frac=0.5, batch_size=256, svd_dim=32, **kwargs):
+    """
+        Splits datset into train, test and val parts by given fractions.
+        The `train_frac` of users in dataset will be train set, and the rest is splitted 
+        into val and test in `val_vs_test_frac` proportion.
+    """
+    train, rem = dataset.split_by_users(train_frac)
+    val, test = rem.split_by_users(val_vs_test_frac)
+    
+    train_loader = torch.utils.data.DataLoader(
+        train,
+        batch_size=batch_size,
+        collate_fn=collate_recommendation_datasets,
+        shuffle=True,
+        **kwargs
+    )
+    
+    val_loader = torch.utils.data.DataLoader(
+        val,
+        batch_size=batch_size,
+        collate_fn=collate_recommendation_datasets,
+        shuffle=False,
+    )
+    
+    test_loader = torch.utils.data.DataLoader(
+        test,
+        batch_size=batch_size,
+        collate_fn=collate_recommendation_datasets,
+        shuffle=False,
+    )
+    return train_loader, val_loader, test_loader,  get_svd_encoder(train, svd_dim)
+
+
+def map_array(arr, mapping):
+    """
+        Map values of array with dict
+    """
+    k = np.array(list(mapping.keys()))
+    v = np.array(list(mapping.values()))
+    sidx = k.argsort()
+
+    k = k[sidx]
+    v = v[sidx]
+    
+    idx = np.searchsorted(k,arr.ravel()).reshape(arr.shape)
+    idx[idx==len(k)] = 0
+    mask = k[idx] == arr
+    out = np.where(mask, v[idx], 0)
+    return out
+
+def get_svd_encoder(dataset, embedding_dim):
+    """
+        Get item embeddings from matrix factorization.
+    """
+    _, _, item_embeddings = randomized_svd(dataset.user_item_matrix, 
+                                           n_components=embedding_dim, 
+                                           n_iter=4,
+                                           power_iteration_normalizer='QR')
+    return item_embeddings.T
+
+
+def collate_recommendation_datasets(batch, padding_value = 0):
+    """
+    Defines, how data samples are batched (respecting different session lengths)
+    Simply padded for now and mask is returned.
+    """
+    batch_size = len(batch)
+    
+    # lengths
+    batch_lengths = [i['length'] for i in batch]
+    batch_lengths = torch.tensor(np.stack(batch_lengths), dtype=torch.long)
+    max_sequence_len = batch_lengths.max().item()
+    
+    # slates: sequences, recommendation, recommended_items)
+    # shape: batch_size, max_sequence_len, max_slate_size
+    batch_slates_item_ids = [
+        torch.tensor(i['slates_item_ids'][:max_sequence_len, :], dtype=torch.long)
+        for i in batch 
+    ]
+    batch_slates_item_ids = torch.nn.utils.rnn.pad_sequence(
+        batch_slates_item_ids, padding_value=padding_value, batch_first=True)
+
+    batch_slates_item_indexes = [
+        torch.tensor(i['slates_item_indexes'][:max_sequence_len, :], dtype=torch.long)
+        for i in batch 
+    ]
+    batch_slates_item_indexes = torch.nn.utils.rnn.pad_sequence(
+        batch_slates_item_indexes, padding_value=padding_value, batch_first=True)
+    
+    # slate masks: True recommended items, False for padding tokens (both sequence padding and slate padding)
+    # shape: batch_size, max_sequence_len, max_slate_size
+    batch_slates_masks = [
+        torch.tensor(i['slates_mask'][:max_sequence_len, :], dtype=torch.bool)
+        for i in batch 
+    ]
+    batch_slates_masks = torch.nn.utils.rnn.pad_sequence(
+        batch_slates_masks, padding_value=False, batch_first=True)
+
+    # in_out mask, same as previous
+    batch_in_mask = torch.zeros_like(batch_slates_masks, dtype=bool)
+    batch_out_mask = torch.zeros_like(batch_slates_masks, dtype=bool)
+    for i, session in enumerate(batch):
+        batch_in_mask[i, : session['in_length'], :] = True
+        batch_out_mask[i, session['in_length'] : , :] = True
+    batch_in_mask = batch_slates_masks & batch_in_mask
+    batch_out_mask = batch_slates_masks & batch_out_mask
+
+
+    # slate_item_embeddings (like slate, but embeddings instead of item ids)
+    # resulting shape (batch_size, max_sequence_len, max_slate_size, embedding dim)
+    batch_slates_item_embeddings = torch.empty(1)
+    if batch[0]['slates_item_embeddings'] is not None:
+        batch_slates_item_embeddings = [
+            torch.tensor(i['slates_item_embeddings'][:max_sequence_len, :, :], dtype=torch.float)
+            for i in batch 
+        ]
+        batch_slates_item_embeddings = torch.nn.utils.rnn.pad_sequence(
+            batch_slates_item_embeddings, padding_value=padding_value, batch_first=True)
+
+    # responses: number of clicks per recommended item
+    # slates: resulting shape (batch_size, max_sequence_len, max_slate_size)
+    batch_responses = [
+        torch.tensor(i['responses'][:max_sequence_len, :], dtype=torch.long)
+        for i in batch 
+    ]
+    batch_responses = torch.nn.utils.rnn.pad_sequence(
+        batch_responses, padding_value=padding_value, batch_first=True)
+
+    # user_embeddings
+    # resulting shape (batch_size, max_sequence_len, embedding dim)
+    batch_user_embeddings = torch.empty(1)
+    if batch[0]['user_embeddings'] is not None:
+        batch_user_embeddings = [
+            torch.tensor(i['user_embeddings'][:max_sequence_len, :], dtype=torch.float)
+            for i in batch 
+        ]
+        batch_user_embeddings = torch.nn.utils.rnn.pad_sequence(
+            batch_user_embeddings, padding_value=padding_value, batch_first=True)
+
+    # user_ids & indexes
+    user_ids = [
+        torch.tensor(i['user_ids'][: max_sequence_len], dtype = torch.long)
+        for i in batch
+    ]
+    user_ids = torch.nn.utils.rnn.pad_sequence(
+            user_ids, padding_value=padding_value, batch_first=True)
+    
+    user_indexes = [
+        torch.tensor(i['user_indexes'][: max_sequence_len], dtype = torch.long)
+        for i in batch
+    ]
+    user_indexes = torch.nn.utils.rnn.pad_sequence(
+            user_indexes, padding_value=padding_value, batch_first=True)
+
+    return {
+          'slates_item_ids': batch_slates_item_ids,
+          'slates_item_indexes': batch_slates_item_indexes,
+          'slates_item_embeddings': batch_slates_item_embeddings,
+          'slates_mask': batch_slates_masks,
+          'responses': batch_responses,
+          'in_mask' : batch_in_mask,
+          'out_mask' : batch_out_mask,
+          # 'responses_masks': self.responses[session_metadata['recommendation_idx']] > 0,
+          'length': batch_lengths,
+          'user_embeddings': batch_user_embeddings,
+          'user_ids': user_ids,
+          'user_indexes' : user_indexes
+        }
+
+
+def update_batch_embeddings(batch, encoder, test=True, agg='mean', **kwargs):
+    """
+        Updates embeddings in batch using given encoder
+        :param encoder: item embeddings from svd
+                            shape: (num_items, embedding dim)
+        :param test: if True, will produce embeddings based only on
+                     a leading part of each sequence (given by batch in_matrix)
+        :param agg: how to transform ioteraction history into user embedding
+    """
+    batch_size, max_sequence = batch['responses'].shape[:2]
+    num_items = encoder.shape[0]
+    embedding_dim = encoder.shape[1]
+    device = batch['responses'].device
+    encoder = torch.tensor(encoder).to(device).float()
+
+    # mask to not include test part of data in encoding
+    in_responces = batch['responses'] > 0
+    if test:
+        in_responces = in_responces & batch['in_mask']
+    else:
+        in_responces = in_responces & batch['slates_mask']
+
+    # make a sequence-item matrix for sequences in batch: 
+    user_item_history = torch.zeros((batch_size, num_items), device = encoder.device)
+    for i in range(batch_size):
+        consumed_item_indexes = batch['slates_item_indexes'][i][in_responces[i]]
+        user_item_history[i, consumed_item_indexes] = 1
+    
+    # embedding for new user is a sum of embeddings of consumed items
+    user_embeddings = user_item_history @ encoder
+    # print(user_embeddings.shape, user_embedding.sum())
+    if agg == 'mean':
+        user_num_iteraction = in_responces.float().view(batch_size, -1).sum(axis = 1)
+        nnz = user_num_iteraction > 0
+        # print(user_num_iteraction.shape, user_embeddings[nnz, :].shape)
+        user_embeddings[nnz, :] = user_embeddings[nnz, :] / user_num_iteraction[nnz, None]
+    # print(user_embeddings.shape, user_embeddings.sum())
+
+    # insert sequence axis
+    user_embeddings = user_embeddings[:, None, :]
+    
+    # copy along sequences
+    user_embeddings = user_embeddings.expand(
+        (batch_size, max_sequence, embedding_dim)
+    )
+
+    item_embeddings = encoder[batch['slates_item_indexes']]
+    
+    # updating embeddings
+    batch['user_embeddings'] = user_embeddings
+    batch['slates_item_embeddings'] = item_embeddings
+    return batch
+
+def evaluate_model(model, data_loader, encoder=None, device='cuda', threshold=0.5, silent=False, debug=False, **kwargs):
+    # run model on dataloader, compute metrics
+    f1 = F1Score(task='binary',average='macro', threshold = threshold).to(device)
+    acc = Accuracy(task='binary', threshold = threshold).to(device)
+    auc = AUROC(task='binary').to(device)
+    
+    model.to(device)
+    model.eval()
+    
+    for batch in tqdm(data_loader, desc='evaluating...', disable=silent):
+        batch = {k:v.to(device) for k, v in batch.items()}
+        if encoder is not None:
+            batch = update_batch_embeddings(batch, encoder, **kwargs)
+        with torch.no_grad():
+            prediction_scores = torch.sigmoid(model(batch))
+        corrects = (batch['responses'][..., None] > 0).float()
+        mask = batch['out_mask'][..., None]
+        
+        # # prediction_shape: (batch_size, max_sequence, 'max_slate, 2)   
+        f1(prediction_scores[mask], corrects[mask])
+        auc(prediction_scores[mask], corrects[mask])
+        acc(prediction_scores[mask], corrects[mask])
+        if debug: 
+            print('\r', prediction_scores[mask], corrects[mask])
+
+
+    gc.collect()
+    return {
+        'f1': f1.compute().item(), 
+        'roc-auc': auc.compute().item(),
+        'accuracy': acc.compute().item()
+    }
+
+
+def fit_treshold(labels, scores):
+    best_f1, best_thold, acc = 0.0, 0.01, 0.0
+    for thold in np.arange(1e-2, 1 - 1e-2, 0.01):
+        preds_labels = scores > thold
+        f1 = binary_f1_score(preds_labels, labels)
+        # print(f"{thold}: {f1}")
+        if f1 > best_f1:
+            acc = binary_accuracy(preds_labels, labels)
+            best_f1, best_thold = f1, thold
+    return best_f1, acc, best_thold
+
+def train(model, train_loader, val_loader, test_loader, encoder=None,  
+          device='cuda', lr=1e-3, num_epochs=50, silent=False, early_stopping=None, **kwargs):   
+    if early_stopping is None:
+        early_stopping = num_epochs
+    model.to(device)
+    best_model = model
+    
+    auc = AUROC(task='binary').to(device)
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    
+    epochs_without_improvement = 0
+    best_val_scores = evaluate_model(model, val_loader, encoder=encoder, device=device, silent=silent)
+    best_test_scores = evaluate_model(model, test_loader, encoder=encoder, device=device, silent=silent)
+    print(f"Test before learning: {best_test_scores}")
+    
+    for epoch in tqdm(range(num_epochs), desc='train'):
+        loss_accumulated = 0.
+        mean_grad_norm = 0.
+        model.train()
+
+        labels = []
+        preds = []
+        
+        gc.collect()        
+        # torch.cuda.empty_cache()
+
+        for batch in tqdm(train_loader, desc=f'epoch {epoch}', disable=silent):
+            batch = {k:v.to(device) for k, v in batch.items()}
+            if encoder is not None:
+                batch = update_batch_embeddings(batch, encoder, **kwargs)
+            raw_scores = model(batch)
+            prediction_scores = torch.sigmoid(raw_scores)
+            corrects = (batch['responses'][..., None] > 0).float()
+            mask = batch['slates_mask'][..., None]
+            # print(raw_scores[mask])
+            # prediction_shape: (batch_size, max_sequence, 'max_slate, 2)
+            loss = torch.nn.functional.binary_cross_entropy(
+                prediction_scores[mask], 
+                corrects[mask],
+            )
+            
+            loss.backward()
+            # print(loss.item())
+            mean_grad_norm += clip_grad_norm_(model.parameters(), 1).sum().item()
+            optimizer.step()
+            
+            loss_accumulated += loss.detach().cpu().item()
+            labels.append(corrects[batch['out_mask'][..., None]].detach().cpu())
+            preds.append(prediction_scores[batch['out_mask'][..., None]].detach().cpu())
+            auc(prediction_scores[mask].detach().cpu(), corrects[mask].detach().cpu())
+        
+        f1, acc, thold = fit_treshold(torch.concat(labels), torch.concat(preds))
+        # print(torch.concat(labels), torch.concat(preds))
+        # for name, p in model.named_parameters():
+        #     print(f"{name}:{p}")
+
+        val_m = evaluate_model(model, val_loader, encoder=encoder, device=device, threshold=thold, silent=silent, **kwargs)
+        if not silent:
+            print(f"Train: epoch: {epoch} | accuracy: {acc} | "
+                  f"f1: {f1} | loss: {loss_accumulated} | "
+                  f"auc: {auc.compute()}  | thld {thold} | grad_norm: {mean_grad_norm / len(train_loader)}")
+            print(f"Val: epoch: {epoch} | accuracy: {val_m['accuracy']} | f1: {val_m['f1']} | auc: {val_m['roc-auc']}")
+
+        epochs_without_improvement += 1
+        if (val_m['roc-auc'], val_m['f1'], val_m['accuracy']) > (best_val_scores['roc-auc'], best_val_scores['f1'], best_val_scores['accuracy']) :
+            epochs_without_improvement=0
+            best_model = deepcopy(model)
+            best_val_scores = val_m
+            best_test_scores = evaluate_model(model, test_loader, encoder=encoder, device=device, threshold=thold, silent=silent )
+            print(f"Test update: epoch: {epoch} |"
+                  f"accuracy: {best_test_scores['accuracy']} | "
+                  f"f1: {best_test_scores['f1']} | "
+                  f"auc: {best_test_scores['roc-auc']} | "
+                  f"tredhold: {thold}"
+            )
+                
+        auc.reset()
+
+        if epochs_without_improvement >= early_stopping or (
+            best_val_scores['roc-auc'] == 1. and
+            best_val_scores['f1'] == 1. and
+            best_val_scores['accuracy'] == 1.):
+            break
+    return model, best_test_scores
