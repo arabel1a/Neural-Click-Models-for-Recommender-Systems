@@ -23,7 +23,8 @@ You will get torch.utils.dataset. Its item is a dict with string keys and numpy 
 ## File structure
 ```
 * benchmark/datasets -- main class with datasets wrapper, and some prepared **datasets.** 
-* benchmark/utils -- utility **stuff**, including models train/evaluate, batch collate function, and so on
+* benchmark/utils -- utility stuff, including models train/evaluate, batch collate function, and so on
+* benchmark/evaluated_models -- models with computed metrics goes here to not mess in root directory
 * benchmark/*.ipynb -- Jupyter notebook with different experiments
 ```
 

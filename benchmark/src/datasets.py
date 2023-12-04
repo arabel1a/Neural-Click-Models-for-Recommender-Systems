@@ -43,11 +43,11 @@ class RecommendationData(Dataset):
                          3,4. 'session_id' and 'user_id'. If one of session or user ids is 
                              not represented in data, let them be the euqal.
                          5. 'timestamp' for sequence-based approaches. If no timestamp 
-                             in dataset, fill enumeration (i.e. sorting responces by 
-                             this column might produce correct order over responces.
+                             in dataset, fill enumeration (i.e. sorting responses by 
+                             this column might produce correct order over responses.
                          6,7.  [optional] 'user_feature_idx' and 'item_feature_idx', meaning 
                              indexes of embeddings in user and item is used ay current 
-                             responce. Taken intro account only if embeddings are presented.
+                             response. Taken intro account only if embeddings are presented.
                              Expected values are in (0, num_user_features) for 
                              user_emb_idx and (0, num_item_featuress) for item_emb_idx.
                              
@@ -58,7 +58,7 @@ class RecommendationData(Dataset):
                                 Expected shape (num_item_features, slate_size, ...). 
         """
         super().__init__
-        assert recommendations.shape == responses.shape, "responces and recommmendations shapes differ"
+        assert recommendations.shape == responses.shape, "responses and recommmendations shapes differ"
         assert metadata.shape[0] == responses.shape[0], "metadata's row count is not equal to numer of recommendations"
         self.num_recommendations = responses.shape[0]
         
@@ -74,7 +74,7 @@ class RecommendationData(Dataset):
         # to avoid corruption if metadata is a view
         self.metadata = metadata.copy()
 
-        # responces as number of clicks for each item in recommendation slate
+        # responses as number of clicks for each item in recommendation slate
         self.responses = responses
         
         # mask for clicked items
@@ -86,11 +86,10 @@ class RecommendationData(Dataset):
         # features
         self.user_features = user_features
         self.item_features = item_features
-
-        # filter to mall sequences
-        self.metadata = self._filter_session_length(self.metadata, **kwargs)
+        
+        # filter small sequences
         self._from_metadata(self.metadata, inplace=True, **kwargs)
-
+                
         self.n_users = len(self.metadata['user_id'].unique())
         self.n_items = len(np.unique(self.recommendations)) 
         # if self.NO_ITEM in self.recommendations:
@@ -142,32 +141,31 @@ class RecommendationData(Dataset):
                              indexes. Defaults to False.
         """
 
-        # first, filter sessions 
+        # first, filter sessions
         m = self._filter_session_length(metadata, **kwargs).copy()
+                
+        # new recomendations, responses & metadata
+        rec = self.recommendations[m['recommendation_idx'],:]
+        resp = self.responses[m['recommendation_idx'],:]
         
-        # new recomendations, responces & metadata
-        rec = self.recommendations[metadata['recommendation_idx'],:]
-        resp = self.responses[metadata['recommendation_idx'],:]
-        
-        # filter user&iyems
+        # filter user&items
         user_features, item_features = None, None
         if self.item_features is not None:
             # drop items without impressions
-           item_features = self.item_features[metadata['item_feature_idx'],:]
-        
+            item_features = self.item_features[m['item_feature_idx'],:]
         if self.user_features is not None:
             # drop users without impressions
-            user_features = self.user_features[metadata['user_feature_idx'],:]
+            user_features = self.user_features[m['user_feature_idx'],:]
             
-        m = metadata.reset_index(drop=True)
+        m.reset_index(drop=True, inplace=True)
         m['recommendation_idx'] = m.index
         m['user_feature_idx'] = m.index
         m['item_feature_idx'] = m.index
-        
+                
         if inplace:
             self.metadata = m
             self.recommendations = rec
-            self.responces = resp
+            self.responses = resp
             self.item_features = item_features
             self.user_features = user_features         
 
@@ -188,11 +186,15 @@ class RecommendationData(Dataset):
     def _filter_session_length(self, metadata, min_session_len = 1, max_session_len=256, **kwargs):
         """
         Removes too short and too long sessions FROM METADATA ONLY.
-        Use with 'from_metadata' to filter responces and recommendations too.
+        Use with 'from_metadata' to filter responses and recommendations too.
         """
         sequence_lengths = metadata['session_id'].value_counts()
-        good_sessions = sequence_lengths[ (sequence_lengths >= min_session_len) & (sequence_lengths <= max_session_len)].index
-        return metadata[ metadata.session_id.isin(good_sessions)]
+        good_sessions = sequence_lengths[ 
+            (sequence_lengths >= min_session_len) & 
+            (sequence_lengths <= max_session_len)
+        ].index
+        new_metadata = metadata[ metadata.session_id.isin(good_sessions)]
+        return new_metadata
                 
     def filter_slate_size(self, size, drop=False):
         if drop:
@@ -340,7 +342,7 @@ class RL4RS(RecommendationData):
         'item_vec' -- string of features, separated by ','
         'price' -- price (constant for item)
         'special_item', 'location' -- ignored for now, some boolean features
-    2. Recomendations and responcessingle csv file. 
+    2. Recomendations and responses single csv file. 
         'timestamp' -- TODO check format, it is not utc
         'exposed_items' -- string with recommended item ids, split by ','
         'user_feedback' -- string with 1 for 'clicked', 0 for 'not clicked
@@ -357,7 +359,7 @@ class RL4RS(RecommendationData):
         metadata = pd.read_csv(os.path.join(path, which), nrows=nrows, delimiter='@')
         metadata['user_id'] = metadata['session_id']
 
-        # recommendations & responces
+        # recommendations & responses
         print('preprocessing ...')
         recommendations = np.array(metadata.exposed_items.str.split(',', expand=True)).astype(int)
         clicks = np.array(metadata.user_feedback.str.split(',', expand=True)).astype(int)
@@ -395,7 +397,7 @@ class ContentWise(RecommendationData):
         especially last three of them
 
     2. impressions-direct-link.csv.gz:
-            'recommendation_id' -- impression id to match with responces	
+            'recommendation_id' -- impression id to match with responses	
          	'recommendation_list_length'
             'recommended_series_list' -- string represenation of python list of serie ids
             'row_position' - ignored
@@ -432,7 +434,7 @@ class ContentWise(RecommendationData):
             validate = "many_to_one",
         )
 
-        # responces
+        # responses
         # Number of clicks on `serie` we define total number of clicks on item in 
         # such `serie`
         responses = np.zeros_like(recommendations)
@@ -486,7 +488,7 @@ class ContentWise(RecommendationData):
 #         self.events = self.raw_events[self.raw_events.user_id.isin(good_users)]
 
 #         recommendations = []
-#         responces = []
+#         responses = []
 #         metadata = []
 #         idx = 0   
         
@@ -510,7 +512,7 @@ class ContentWise(RecommendationData):
 #                     recommendations.append(cr + [-1] * (max_slate_size - len(cr)))
 #                     resp = [0 for x in currernt_rec]
 #                     resp[cr.index(row.product_id)]
-#                     responces.append(resp + [-1] * (max_slate_size - len(cr)) )
+#                     responses.append(resp + [-1] * (max_slate_size - len(cr)) )
 #                     metadata.append({
 #                         'user_id': row.user_id,
 #                         'recommendation_idx': idx,
@@ -521,7 +523,7 @@ class ContentWise(RecommendationData):
 #                     currernt_rec.remove(row.product_id) 
 #         super().__init__(
 #             np.array(recommendations).astype(int),
-#             np.array(responces).astype(int),
+#             np.array(responses).astype(int),
 #             pd.DataFrame(metadata)
 #         )
 
