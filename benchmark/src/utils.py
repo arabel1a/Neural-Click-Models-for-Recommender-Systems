@@ -315,11 +315,16 @@ def train(model, train_loader, val_loader, test_loader,
             best_model = deepcopy(model)
             best_val_scores = val_m
             best_test_scores = evaluate_model(model, test_loader, device=device, threshold=thold, silent=silent )
-            print(f"Test update: epoch: {epoch} |"
+            print(f"Val update: epoch: {epoch} |"
+                  f"accuracy: {best_val_scores['accuracy']} | "
+                  f"f1: {best_val_scores['f1']} | "
+                  f"auc: {best_val_scores['roc-auc']} | "
+                  f"treshold: {thold}"
+            )
+            print(f"Test: "
                   f"accuracy: {best_test_scores['accuracy']} | "
                   f"f1: {best_test_scores['f1']} | "
                   f"auc: {best_test_scores['roc-auc']} | "
-                  f"treshold: {thold}"
             )
                 
         auc.reset()

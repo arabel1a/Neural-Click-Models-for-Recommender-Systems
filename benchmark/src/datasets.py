@@ -1,21 +1,21 @@
-import torch
-from torch.utils.data import Dataset, DataLoader
+import numpy as np
 import os
 import pandas as pd
-import numpy as np
-from scipy.sparse import dok_matrix, csr_matrix
 import pickle
 import re
-from tqdm import tqdm
-from copy import deepcopy
+import torch
 import torch.nn.functional as F
 
+from torch.utils.data import Dataset, DataLoader
+from scipy.sparse import dok_matrix, csr_matrix
+from tqdm import tqdm
+from copy import deepcopy
+
+from datetime import datetime, timedelta
 from torchmetrics import AUROC, F1Score, Accuracy
-
-
 from src.utils import map_array
 
-class RecommendationData(Dataset):
+class RecommendationData(Dataset):    
     # special id (in recommendation slate) to represent 'nothing'
     # useful for situations, where slate size may vary
     NO_ITEM = -1
@@ -267,6 +267,7 @@ class RecommendationData(Dataset):
             'user_embeddings': None if self.user_features is None else self.user_features[session_metadata['user_feature_idx']],
             'user_ids': session_metadata['user_id'].to_numpy(),
             'user_indexes': session_metadata['user_idx'].to_numpy(),
+            'session':session
         }
         return self.prepared_data_cache[idx]
 
@@ -461,71 +462,74 @@ class ContentWise(RecommendationData):
         super().__init__(recommendations, responses, metadata, **kwargs)
 
 
-### FIXME
-# class OpenCDP_one_purchase_from_cart(RecommendationData):
-#     """
-#     Consist of several file (event logs splitted by months).
-#         'event_time' -- timestamp in iso format
-#         'event_type' -- one of 'view', 'cart', 'remove_from_cart', 'purchase'
-#         'product_id' -- id of item
-#         'user_id', 'user_ssession' -- user data
-#         'price' -- the only feature of item used
+class OpenCDP(RecommendationData):
+    def __init__(self, data_dir, files=None, min_session_len=24, window_size=8, max_active_hours=24, **kwargs):
+        """
+        Reads all .csv from data_dir directory, and concatenates them to one larga table 
+        :param files: if specified, loads only specified subset of data files
+        :param min_session_len: drops sessions with fewer number of events
+        :param window_size: how many consequent events are threaten as one recommendation
+        :param max_active_hours: max session duration in hours.
+        """
+        # reading files
+        print('reading files...')
+        files = os.listdir(data_dir) if files is None else files
+        events = [pd.read_csv(os.path.join(data_dir, file)) for file in files]
+        raw_events = pd.concat(events)
+        print(f"total {len(raw_events)} raw events")
         
-#         'brand', 'category_code', 'category_id', -- ignored
+        # dropping too short session
+        c = raw_events[["user_session","event_time"]].groupby('user_session').count()
+        good_sessions = c[c.event_time > 30].index
+        raw_events = raw_events[raw_events.user_session.isin(good_sessions)]
+        print(f"after filtering total {len(raw_events)} events")
 
-    
-#     """
-#     def __init__(self, dir, files, events_per_user_thold=20, max_slate_size=50):
-#         events = []
-#         for file in files:
-#             events.append( pd.read_csv(os.path.join(dir, file)))
-#         self.raw_events = pd.concat(events)
-#         logger.info(f'read {self.raw_events.shape} lines')
-#         users_event_cnt = self.raw_events.groupby('user_id').agg(
-#         {'event_time':'count'}
-#          ).reset_index()
-#         good_users = users_event_cnt[users_event_cnt['event_time'] > events_per_user_thold].user_id
-#         self.events = self.raw_events[self.raw_events.user_id.isin(good_users)]
+        # aggregating sequence of events into "recommendations"
+        recommendations = []
+        responses = []
+        metadata = []
+        for session, group in tqdm(raw_events.groupby('user_session')):
+            rec = []
+            clicks = []
+            for timestamp, row in group.sort_values(by='event_time').iterrows():
+                # purchases and removing from catr are ignored
+                if row.event_type == 'remove_from_cart' or row.event_type == 'purchase':
+                    continue
+                    
+                if len(rec) == 0:
+                    first_action = datetime.strptime(row.event_time, "%Y-%m-%d %H:%M:%S UTC")
+                
+                if row.event_type == 'cart':
+                    if row.product_id not in rec:
+                        rec.append(row.product_id)
+                        clicks.append(1)
+                    else:
+                        clicks[rec.index(row.product_id)] += 1
 
-#         recommendations = []
-#         responses = []
-#         metadata = []
-#         idx = 0   
+                elif row.event_type == 'view':
+                    rec.append(row.product_id)
+                    clicks.append(0)
+                else:
+                    raise ValueError
         
-#         for user, group in tqdm(self.events.groupby('user_id')):
-#             currernt_rec = set()
-#             group = group[group.event_type.isin(['purchase', 'cart', 'remove_from_cart'])]
-#             for timestamp, row in group.sort_values(by='event_time').iterrows():
-#                 if row.event_type == 'cart':
-#                     currernt_rec.add(row.product_id)
-#                 elif row.event_type == 'remove_from_cart':
-#                      currernt_rec.discard(row.product_id)
-#                 else:
-#                     if not row.product_id in currernt_rec:
-#                         continue
-#                     cr = list(currernt_rec)
-                        
-#                     # bad way to drop too long session
-#                     if len(cr) > max_slate_size or len(cr) < 2:
-#                         continue
-                        
-#                     recommendations.append(cr + [-1] * (max_slate_size - len(cr)))
-#                     resp = [0 for x in currernt_rec]
-#                     resp[cr.index(row.product_id)]
-#                     responses.append(resp + [-1] * (max_slate_size - len(cr)) )
-#                     metadata.append({
-#                         'user_id': row.user_id,
-#                         'recommendation_idx': idx,
-#                         'session_id':row.user_id,
-#                         'timestamp': timestamp
-#                     })
-#                     idx += 1
-#                     currernt_rec.remove(row.product_id) 
-#         super().__init__(
-#             np.array(recommendations).astype(int),
-#             np.array(responses).astype(int),
-#             pd.DataFrame(metadata)
-#         )
-
-# o = OpenCDP_one_purchase_from_cart(opencdp_dir,m )
-  
+                if (datetime.strptime(row.event_time, "%Y-%m-%d %H:%M:%S UTC") -
+                        first_action >
+                        timedelta(hours=max_active_hours)):
+                    rec.extend([self.NO_ITEM] * (window_size - len(rec)))
+                    clicks.extend([0] * (window_size - len(clicks)))                    
+                if len(rec) == window_size:
+                    metadata.append({
+                        'recommendation_idx': len(recommendations),
+                        'session_id': row.user_session,
+                        'user_id': row.user_id,
+                        'timestamp': row.event_time,    
+                    })
+                    recommendations.append(rec)
+                    responses.append(clicks)
+                    rec, clicks = [], []
+        super().__init__(
+            recommendations = np.array(recommendations).astype(int),
+            responses = np.array(responses).astype(int),
+            metadata = pd.DataFrame(metadata),
+            **kwargs
+        )
