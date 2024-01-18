@@ -15,8 +15,7 @@ from sklearn.utils.extmath import randomized_svd
 
 
 from torchmetrics import AUROC, F1Score, Accuracy
-from torchmetrics.functional.classification import binary_f1_score, binary_accuracy
-
+from torchmetrics.functional.classification import binary_f1_score, binary_accuracy  
 
 def get_dummy_data(d):
     dummy_loader = torch.utils.data.DataLoader(
@@ -27,14 +26,14 @@ def get_dummy_data(d):
     )
     return dummy_loader, d.user_item_matrix
 
-def get_train_val_test_tmatrix_tnumitems(dataset, train_frac=0.8, val_vs_test_frac=0.5, batch_size=256, **kwargs):
+def get_train_val_test_tmatrix_tnumitems(dataset, train_frac=0.8, val_vs_test_frac=0.5, batch_size=256, seed=None, **kwargs):
     """
         Splits datset into train, test and val parts by given fractions.
         The `train_frac` of users in dataset will be train set, and the rest is splitted 
         into val and test in `val_vs_test_frac` proportion.
     """
-    train, rem = dataset.split_by_users(train_frac)
-    val, test = rem.split_by_users(val_vs_test_frac)
+    train, rem = dataset.split_by_users(train_frac, seed=seed)
+    val, test = rem.split_by_users(val_vs_test_frac, seed=seed)
     
     train_loader = torch.utils.data.DataLoader(
         train,

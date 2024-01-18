@@ -3,6 +3,7 @@ import os
 import pandas as pd
 import pickle
 import re
+import sys
 import torch
 import torch.nn.functional as F
 
@@ -13,7 +14,10 @@ from copy import deepcopy
 
 from datetime import datetime, timedelta
 from torchmetrics import AUROC, F1Score, Accuracy
-from src.utils import map_array
+
+current_dir = os.path.realpath(os.path.dirname(__file__))
+sys.path.append(current_dir)
+from utils import map_array
 
 class RecommendationData(Dataset):    
     # special id (in recommendation slate) to represent 'nothing'
@@ -86,6 +90,8 @@ class RecommendationData(Dataset):
         # features
         self.user_features = user_features
         self.item_features = item_features
+        if self.item_features is not None:
+            self.embeddings_dim = item_features.shape[-1]
         
         # filter small sequences
         self._from_metadata(self.metadata, inplace=True, **kwargs)
@@ -104,11 +110,10 @@ class RecommendationData(Dataset):
         self.recommendations_indexes = map_array(self.recommendations, self.item_id2index)
         self.metadata['user_idx'] = map_array(self.metadata['user_id'].to_numpy(), self.user_id2index)
 
+        # sorting & indexing for faster loading
         self.sessions = self.metadata['session_id'].unique().tolist()
-
-        # print("caching prepared data...")
-        # for i in tqdm(range(self.__len__())):
-        #     self.__getitem__(i)
+        self.metadata.set_index(['session_id', 'timestamp'], drop=False, inplace=True)
+        self.metadata.sort_index(inplace=True)
         
     def dump(self, path):
         """
@@ -148,7 +153,7 @@ class RecommendationData(Dataset):
         rec = self.recommendations[m['recommendation_idx'],:]
         resp = self.responses[m['recommendation_idx'],:]
         
-        # filter user&items
+        # filter user & items
         user_features, item_features = None, None
         if self.item_features is not None:
             # drop items without impressions
@@ -204,13 +209,14 @@ class RecommendationData(Dataset):
             self.response_mask = self.response_mask[...,:size]
             self.responses = self.responses[...,:size]
             
-    def split_by_users(self, ratio = 0.8, **kwargs):
+    def split_by_users(self, ratio = 0.8, seed=None, **kwargs):
         """
         :param float ratio:  frac of users TODO change to frac of rows
         :return: two RecommendationData classes, obtained 
                 from current by splitting current by users.
         """
         permutation = self.metadata['user_id'].unique()
+        np.random.seed(seed)
         np.random.shuffle(permutation)
         train_users = permutation[:int(self.n_users * ratio)]
         test_users = permutation[int(self.n_users * ratio):]
@@ -245,17 +251,52 @@ class RecommendationData(Dataset):
                 user_item_matrix[user, item] += self.responses[idx, position]
         self.user_item_matrix = user_item_matrix.tocsr()
 
-    def update_embeddings(user_embeddings, item_embedidngs):
-        # TODO
-        pass
-
     def __getitem__(self, idx):
+        """
+            Gets one datapoint (a history of interactions for single session).
+            In what follows, define:
+                * R -- number of recommendations for this
+                * S - slate size
+                * Eu, Ei - embedding dim for users and items
+            Datapoint is a dictionary with the following content:
+
+            Item data:
+                'slates_item_ids': np.array with shape (R, S). Cell (i, j)
+                                contains an id of item which was recommended
+                                at j-th position of i-th slate.
+                'slates_item_indexes': np.array with shapr (R, S). Same as previous,
+                                but with indexes (0...N) instead if ids. Used to
+                                index embeddings: nn.Embeddings nor scipy.sparse
+                                can not be used with custom index.
+                'slates_item_embeddings': np.array with shape (R, S, Ei).
+                                Contains embeddings for each recommended item.
+            User data:
+                'user_ids': np.array of shape (R). User id, repeaten R times.
+                'user_indexes': np.array of shape (R). User index, repeaten R times.
+                'user_embeddings': np.array with shape (R, Eu). User embeddings for
+                                   each iteraction.
+            Iteraction data:
+                'slates_mask': np.array with shapr (R, S). True for recommended items,
+                                False for placeholder.
+                'responses': np.array with shape (R, S). Cell (i, j)
+                                contains an id number of iteractions item
+                                at j-th position of i-th slate.
+                'session': unique session identifier. Not used.
+                'length': int. R.
+                'in_length': int. Used in test datasets to fit on user before evaluation.
+                             0.8 * R usually.
+        """
         if idx in self.prepared_data_cache:
             return self.prepared_data_cache[idx]
         session = self.sessions[idx]
-        session_metadata = self.metadata[self.metadata['session_id'] == session].sort_values('timestamp')
+        if session in self.metadata.index:
+            session_metadata = self.metadata.loc[[session]]
+        else:
+            session_metadata = self.metadata[
+                self.metadata['session_id'] == session
+            ].sort_values('timestamp')
         in_size = int(0.8 * len(session_metadata))
-        out_size = len(session_metadata) - in_size
+
         self.prepared_data_cache[idx] = {
             'slates_item_ids': self.recommendations[session_metadata['recommendation_idx']],
             'slates_item_indexes':self.recommendations_indexes[session_metadata['recommendation_idx']],
@@ -269,16 +310,21 @@ class RecommendationData(Dataset):
             'user_indexes': session_metadata['user_idx'].to_numpy(),
             'session':session
         }
+
         return self.prepared_data_cache[idx]
 
     def __len__(self):
         return len(self.sessions)
     
     def __repr__(self):
-        return ("\nRecomendation Dataset\n"
-                f"users: \t{self.n_users}\n"
-                f"items: \t{self.n_items}\n"
-                f"recommendations: {self.recommendations.shape[0]}\n"
+        return (
+            "\nRecomendation Dataset\n"
+            f"users: \t{self.n_users}\n"
+            f"items: \t{self.n_items}\n"
+            f"recommendations: {self.recommendations.shape[0]}\n"
+            # f"mean session length: {0}\n"
+            # f"mean clicks per recommendation length: {0}\n"
+            # f"mean recommendation length: {0}\n"
         )
 
 
@@ -335,7 +381,6 @@ class DummyData(RecommendationData):
 
 
 class RL4RS(RecommendationData):
-# if True:
     """
     Data structure: 
     1. Item embeddings (obfuscated features) file:

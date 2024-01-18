@@ -46,7 +46,7 @@ class RecsysEmbedding(torch.nn.Module):
             self.embedding_dim
         )
         if self.embeddings == 'svd':
-            item_embeddings[seen_items] = self.item_embeddings[batch['slates_item_indexes'][seen_items]]
+            item_embeddings[seen_items] = self.item_embeddings.to(device)[batch['slates_item_indexes'][seen_items]]
         elif self.embeddings == 'neural':
             item_embeddings[seen_items] = self.item_embeddings(batch['slates_item_indexes'][seen_items])
         elif self.embeddings == 'explicit':
