@@ -7,6 +7,7 @@ from scipy.sparse import dok_matrix, csr_matrix
 import pickle
 import re
 import gc
+from collections import Counter, OrderedDict
 from tqdm import tqdm
 from copy import deepcopy
 import torch.nn.functional as F
@@ -127,7 +128,7 @@ def collate_recommendation_datasets(batch, padding_value = 0):
     ]
     batch_slates_masks = torch.nn.utils.rnn.pad_sequence(
         batch_slates_masks, 
-        padding_value=False, 
+        padding_value=False,
         batch_first=True
     )
 
@@ -140,7 +141,6 @@ def collate_recommendation_datasets(batch, padding_value = 0):
     batch_in_mask = batch_slates_masks & batch_in_mask
     batch_out_mask = batch_slates_masks & batch_out_mask
 
-
     # slate_item_embeddings (like slate, but embeddings instead of item ids)
     # resulting shape (batch_size, max_sequence_len, max_slate_size, embedding dim)
     batch_slates_item_embeddings = torch.empty(1)
@@ -151,6 +151,17 @@ def collate_recommendation_datasets(batch, padding_value = 0):
         ]
         batch_slates_item_embeddings = torch.nn.utils.rnn.pad_sequence(
             batch_slates_item_embeddings, padding_value=padding_value, batch_first=True)
+
+    # slate_item_categorical (like slate, but embeddings instead of item ids)
+    # resulting shape (batch_size, max_sequence_len, max_slate_size, embedding dim)
+    batch_slates_item_categorical = torch.empty(1)
+    if batch[0]['slates_item_categorical'] is not None:
+        batch_slates_item_categorical = [
+            torch.tensor(i['slates_item_categorical'][:max_sequence_len, :, :], dtype=torch.long)
+            for i in batch
+        ]
+        batch_slates_item_categorical = torch.nn.utils.rnn.pad_sequence(
+            batch_slates_item_categorical, padding_value=padding_value, batch_first=True)
 
     # responses: number of clicks per recommended item
     # slates: resulting shape (batch_size, max_sequence_len, max_slate_size)
@@ -191,6 +202,7 @@ def collate_recommendation_datasets(batch, padding_value = 0):
           'slates_item_ids': batch_slates_item_ids,
           'slates_item_indexes': batch_slates_item_indexes,
           'slates_item_embeddings': batch_slates_item_embeddings,
+          'slates_item_categorical': batch_slates_item_categorical,
           'slates_mask': batch_slates_masks,
           'responses': batch_responses,
           'in_mask' : batch_in_mask,
@@ -338,3 +350,39 @@ def train(model, train_loader, val_loader, test_loader,
             best_val_scores['accuracy'] == 1.):
             break
     return model, best_test_scores
+
+class Indexer:
+    """
+        Index <--> Id register
+        default index: 0
+    """
+    def __init__(self, default_token=None):
+        self.default_token = default_token
+        self.index2id = [ default_token ]
+        self.id2index = {default_token:0}
+        self.counter = Counter()
+
+    def update(self, value):
+        if value in self.id2index:
+            return self.id2index[value]
+        else:
+            idx = len(self.index2id)
+            self.index2id.append(value)
+            self.id2index[value] = idx
+            return idx
+
+    def get(self, value):
+        if value not in self.id2index:
+            return 0
+        return self.id2index[value]
+
+    def from_iter(self, column, min_occurences=5):
+        counter = self.counter.update(column)
+        frequent = {
+            id for id in self.counter if self.counter[id] > min_occurences
+        }
+        frequent.discard(self.default_token)
+        self.index2id = [ self.default_token ] + list(frequent)
+        self.id2index = { id:index for (index, id) in enumerate(self.index2id) }
+        return self
+
