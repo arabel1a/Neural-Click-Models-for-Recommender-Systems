@@ -17,7 +17,7 @@ from torchmetrics import AUROC, F1Score, Accuracy
 
 current_dir = os.path.realpath(os.path.dirname(__file__))
 sys.path.append(current_dir)
-from utils import map_array
+from utils import map_array, Indexer
 
 class RecommendationData(Dataset):    
     # special id (in recommendation slate) to represent 'nothing'
@@ -26,7 +26,8 @@ class RecommendationData(Dataset):
     
     def __init__(self, recommendations: np.array, responses: np.array, metadata:pd.DataFrame, 
                  user_item_matrix = None, user_id2index = None, item_id2index=None,
-                 item_features: np.array =None, user_features: np.array =None, **kwargs):
+                 item_features: np.array =None, user_features: np.array =None,
+                 item_categorical: np.array =None, user_categorical: np.array =None, **kwargs):
         """
         :param recommendations: NumPy array with impressions. If slate size 
                                 can differ, fill last X values must contain
@@ -47,21 +48,25 @@ class RecommendationData(Dataset):
                          3,4. 'session_id' and 'user_id'. If one of session or user ids is 
                              not represented in data, let them be the euqal.
                          5. 'timestamp' for sequence-based approaches. If no timestamp 
-                             in dataset, fill enumeration (i.e. sorting responses by 
+                             in dataset, fill enumeration (i.e. sorting responses by
                              this column might produce correct order over responses.
                          6,7.  [optional] 'user_feature_idx' and 'item_feature_idx', meaning 
-                             indexes of embeddings in user and item is used ay current 
+                             indexes of embeddings in user and item is used by current
                              response. Taken intro account only if embeddings are presented.
                              Expected values are in (0, num_user_features) for 
                              user_emb_idx and (0, num_item_featuress) for item_emb_idx.
                              
-        :param user_features: [optional] Numpy array with embeddings for user. 
-                                Expected shape (num_user_features, ...). 
-                                
-        :param item_features: [optional] Numpy array with embeddings for item. 
-                                Expected shape (num_item_features, slate_size, ...). 
+        :param user_features: [optional] Numpy array with embeddings for user.
+                                Expected shape (num_user_features, ...).
+        :param user_categorical: [optional] Numpy array with category features for user.
+                                Expected shape (num_user_features, ...).
+
+        :param item_features: [optional] Numpy array with embeddings for item.
+                                Expected shape (num_item_features, slate_size, ...).
+        :param item_categorical: [optional] Numpy array with category features for item.
+                                Expected shape (num_item_features, slate_size, ...).
         """
-        super().__init__
+        super().__init__()
         assert recommendations.shape == responses.shape, "responses and recommmendations shapes differ"
         assert metadata.shape[0] == responses.shape[0], "metadata's row count is not equal to numer of recommendations"
         self.num_recommendations = responses.shape[0]
@@ -90,16 +95,17 @@ class RecommendationData(Dataset):
         # features
         self.user_features = user_features
         self.item_features = item_features
+        self.item_categorical = item_categorical
+        self.user_categorical = user_categorical
         if self.item_features is not None:
-            self.embeddings_dim = item_features.shape[-1]
+            self.embedding_dim = item_features.shape[-1]
         
         # filter small sequences
         self._from_metadata(self.metadata, inplace=True, **kwargs)
                 
         self.n_users = len(self.metadata['user_id'].unique())
         self.n_items = len(np.unique(self.recommendations)) 
-        # if self.NO_ITEM in self.recommendations:
-        #     self.n_items -= 1
+
         
         self.user_item_matrix = user_item_matrix
         self.user_id2index = user_id2index
@@ -153,14 +159,19 @@ class RecommendationData(Dataset):
         rec = self.recommendations[m['recommendation_idx'],:]
         resp = self.responses[m['recommendation_idx'],:]
         
-        # filter user & items
-        user_features, item_features = None, None
+        # drop items & users without impressions
+        user_features, item_features, user_categorical, item_categorical = (
+            None, None, None, None
+        )
         if self.item_features is not None:
-            # drop items without impressions
             item_features = self.item_features[m['item_feature_idx'],:]
+        if self.item_categorical is not None:
+            item_categorical = self.item_categorical[m['item_feature_idx'],:]
         if self.user_features is not None:
-            # drop users without impressions
             user_features = self.user_features[m['user_feature_idx'],:]
+        if self.user_categorical is not None:
+            user_categorical = self.user_categorical[m['user_feature_idx'],:]
+
             
         m.reset_index(drop=True, inplace=True)
         m['recommendation_idx'] = m.index
@@ -172,19 +183,22 @@ class RecommendationData(Dataset):
             self.recommendations = rec
             self.responses = resp
             self.item_features = item_features
-            self.user_features = user_features         
-
+            self.user_features = user_features
+            self.item_categorical = item_categorical
+            self.user_categorical = user_categorical
         else:
             return RecommendationData(
-            rec, 
-            resp,
-            m, 
-            item_features = self.item_features, 
-            user_features = self.user_features,
-            user_item_matrix = self.user_item_matrix,
-            item_id2index = self.item_id2index,
-            user_id2index = self.user_id2index,
-            **kwargs
+                rec,
+                resp,
+                m,
+                item_features = item_features,
+                user_features = user_features,
+                item_categorical = item_categorical,
+                user_categorical = user_categorical,
+                user_item_matrix = self.user_item_matrix,
+                item_id2index = self.item_id2index,
+                user_id2index = self.user_id2index,
+                **kwargs
             )
         
     
@@ -296,16 +310,18 @@ class RecommendationData(Dataset):
                 self.metadata['session_id'] == session
             ].sort_values('timestamp')
         in_size = int(0.8 * len(session_metadata))
-
         self.prepared_data_cache[idx] = {
             'slates_item_ids': self.recommendations[session_metadata['recommendation_idx']],
             'slates_item_indexes':self.recommendations_indexes[session_metadata['recommendation_idx']],
             'slates_item_embeddings': None if self.item_features is None else self.item_features[session_metadata['item_feature_idx']],
+            'slates_item_categorical': None if self.item_categorical is None else self.item_categorical[session_metadata['item_feature_idx']],
             'slates_mask': (self.recommendations[session_metadata['recommendation_idx']] != self.NO_ITEM),
             'responses': self.responses[session_metadata['recommendation_idx']],
+            'response_timestamps': None, # TODO
             'in_length': in_size,
             'length': len(session_metadata),
             'user_embeddings': None if self.user_features is None else self.user_features[session_metadata['user_feature_idx']],
+            'user_categorical': None if self.user_categorical is None else self.user_categorical[session_metadata['user_feature_idx']],
             'user_ids': session_metadata['user_id'].to_numpy(),
             'user_indexes': session_metadata['user_idx'].to_numpy(),
             'session':session
@@ -368,7 +384,24 @@ class DummyData(RecommendationData):
                 [0, 0]
             ] 
         ])
-                                   
+        item_categorical = np.array([
+            [
+                [1, 3],
+                [1, 3],
+                [3, 3]
+            ],
+            [
+                [3, 3],
+                [1, 1],
+                [0, 0]
+            ],
+            [
+                [1, 3],
+                [2, 2],
+                [3, 1]
+            ]
+        ])
+
         metadata = pd.DataFrame({
             'recommendation_idx' : [0, 1, 2],
             'user_id': [13, 13, 0],
@@ -377,7 +410,14 @@ class DummyData(RecommendationData):
             'user_feature_idx': [0, 0, 1],
             'item_feature_idx': [0, 1, 2],
         })
-        super().__init__(recommendations, responses, metadata, user_features=user_embeddings, item_features=item_embeddings)
+        super().__init__(
+            recommendations,
+            responses,
+            metadata,
+            user_features=user_embeddings,
+            item_features=item_embeddings,
+            item_categorical=item_categorical
+        )
 
 
 class RL4RS(RecommendationData):
@@ -533,45 +573,66 @@ class OpenCDP(RecommendationData):
         recommendations = []
         responses = []
         metadata = []
+        category_features = []
+        brand_indexer = Indexer(np.nan).from_iter(raw_events.brand)
+        cat_indexer = Indexer(np.nan).from_iter(raw_events.category_code)
         for session, group in tqdm(raw_events.groupby('user_session')):
             rec = []
+            cat_features = []
             clicks = []
             for timestamp, row in group.sort_values(by='event_time').iterrows():
                 # purchases and removing from catr are ignored
                 if row.event_type == 'remove_from_cart' or row.event_type == 'purchase':
                     continue
-                    
+
                 if len(rec) == 0:
                     first_action = datetime.strptime(row.event_time, "%Y-%m-%d %H:%M:%S UTC")
-                
+
                 if row.event_type == 'cart':
                     if row.product_id not in rec:
                         rec.append(row.product_id)
+                        cat_features.append(
+                            [
+                                cat_indexer.get(row.category_code),
+                                brand_indexer.get(row.brand)
+                            ]
+                        )
                         clicks.append(1)
                     else:
                         clicks[rec.index(row.product_id)] += 1
 
                 elif row.event_type == 'view':
                     rec.append(row.product_id)
+                    cat_features.append(
+                        [
+                            cat_indexer.get(row.category_code),
+                            brand_indexer.get(row.brand)
+                        ]
+                    )
                     clicks.append(0)
                 else:
                     raise ValueError
-        
                 if (datetime.strptime(row.event_time, "%Y-%m-%d %H:%M:%S UTC") -
                         first_action >
                         timedelta(hours=max_active_hours)):
                     rec.extend([self.NO_ITEM] * (window_size - len(rec)))
-                    clicks.extend([0] * (window_size - len(clicks)))                    
+                    clicks.extend([0] * (window_size - len(clicks)))
+                    cat_features.extend(
+                        [[0, 0]] * (window_size - len(cat_features))
+                    )
+
                 if len(rec) == window_size:
                     metadata.append({
                         'recommendation_idx': len(recommendations),
+                        'item_feature_idx': len(recommendations),
                         'session_id': row.user_session,
                         'user_id': row.user_id,
-                        'timestamp': row.event_time,    
+                        'timestamp': row.event_time,
                     })
                     recommendations.append(rec)
                     responses.append(clicks)
-                    rec, clicks = [], []
+                    category_features.append(cat_features)
+                    rec, clicks, cat_features = [], [], []
         super().__init__(
             recommendations = np.array(recommendations).astype(int),
             responses = np.array(responses).astype(int),
