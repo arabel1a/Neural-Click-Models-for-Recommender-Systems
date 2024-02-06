@@ -25,7 +25,8 @@ You will get torch.utils.dataset. Its item is a dict with string keys and numpy 
 * benchmark/datasets -- main class with datasets wrapper, and some prepared **datasets.** 
 * benchmark/utils -- utility stuff, including models train/evaluate, batch collate function, and so on
 * benchmark/evaluated_models -- models with computed metrics goes here to not mess in root directory
-* benchmark/*.ipynb -- Jupyter notebook with different experiments
+* benchmark/*|
+|-- Jupyter notebook with different experiments
 ```
 
 ## Wrapping your own dataset
@@ -34,3 +35,17 @@ Also see comments in ContentWise and RL4RS, it might be helpful.
 There is a class DummyData with few users and items. Maybe it can help you understand what's happening.
 
 If you have any further questions or need additional assistance, feel free to ask!
+
+## Models
+
+| notebook name         | experiment name <br>(=result file suffix) | Class name | Paper Name | Comment. |
+| --------------------- | ----------------------------------------- | ---------- | ---------- | -------- |
+| matrix_factorization  | MatrixFactorization      	| MF                 	| MF | |
+| logreg                | LogReg                   	| LogisticRegression 	| Logistic<br>regression | |
+| logreg_category_embs  | LogRegCE				 	| LogisticRegression 	| -- | same with `logreg`, but use new embeddings |
+| slatewise_attention   | SlatewiseAttention       	| SlatewiseAttention 	| Slate-wise Transformer| |
+| attention_plus_gru    | AttentionGRU 			   	| AttentionGRU			| Transformer<br>+ GRU| |
+| attention+gru         | AttentionGRU2				| AttentionGRU2			| --- | another version of previous |
+| scot                  | SCOT                     	| SCOT					| SCOT | |
+| sessionwise_gru       | SessionwiseGRU 		   	| SessionwiseGRU		| Session-wise<br>GRU | |
+| slatewise_gru         | SlatewiseGRU             	| SlatewiseGRU       	| Slate-wise<br>GRU | |
