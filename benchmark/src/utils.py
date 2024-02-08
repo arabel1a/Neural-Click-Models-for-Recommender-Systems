@@ -189,7 +189,17 @@ def collate_recommendation_datasets(batch, padding_value = 0):
         for i in batch
     ]
     user_ids = torch.nn.utils.rnn.pad_sequence(
-            user_ids, padding_value=padding_value, batch_first=True)
+        user_ids, padding_value=padding_value, batch_first=True
+    )
+
+    # reccommendation_indexes
+    recommendation_indexes = [
+        torch.tensor(i['recommendation_idx'][: max_sequence_len], dtype = torch.long)
+        for i in batch
+    ]
+    recommendation_indexes = torch.nn.utils.rnn.pad_sequence(
+        recommendation_indexes, padding_value=-1, batch_first=True
+    )
     
     user_indexes = [
         torch.tensor(i['user_indexes'][: max_sequence_len], dtype = torch.long)
@@ -212,7 +222,8 @@ def collate_recommendation_datasets(batch, padding_value = 0):
           'in_length': in_lengths,
           'user_embeddings': batch_user_embeddings,
           'user_ids': user_ids,
-          'user_indexes' : user_indexes
+          'user_indexes' : user_indexes,
+          'recommendation_indexes': recommendation_indexes
         }
 
 def evaluate_model(model, data_loader, device='cuda', threshold=0.5, silent=False, debug=False, **kwargs):

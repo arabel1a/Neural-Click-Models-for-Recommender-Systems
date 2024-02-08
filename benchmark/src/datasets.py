@@ -67,6 +67,7 @@ class RecommendationData(Dataset):
                                 Expected shape (num_item_features, slate_size, ...).
         """
         super().__init__()
+        self.predicted_probs, self.predicted_responses = None, None
         assert recommendations.shape == responses.shape, "responses and recommmendations shapes differ"
         assert metadata.shape[0] == responses.shape[0], "metadata's row count is not equal to numer of recommendations"
         self.num_recommendations = responses.shape[0]
@@ -324,7 +325,8 @@ class RecommendationData(Dataset):
             'user_categorical': None if self.user_categorical is None else self.user_categorical[session_metadata['user_feature_idx']],
             'user_ids': session_metadata['user_id'].to_numpy(),
             'user_indexes': session_metadata['user_idx'].to_numpy(),
-            'session':session
+            'session':session,
+            'recommendation_idx': session_metadata['recommendation_idx'].to_numpy()
         }
 
         return self.prepared_data_cache[idx]
@@ -343,7 +345,28 @@ class RecommendationData(Dataset):
             # f"mean recommendation length: {0}\n"
         )
 
-
+    def to_iteraction_matrix(self):
+        result = []
+        for _, row in self.metadata.iterrows():
+            slate = self.recommendations[row.recommendation_idx]
+            for slate_pos, item_id in enumerate(slate):
+                if item_id == self.NO_ITEM: break
+                res = row.to_dict()
+                res['response'] = self.responses[row.recommendation_idx, slate_pos]
+                if self.predicted_probs is not None:
+                    res['predicted_prob'] = self.predicted_probs[row.recommendation_idx, slate_pos]
+                if self.predicted_responses is not None:
+                    res['predicted_response'] = self.predicted_responses[row.recommendation_idx, slate_pos]
+                if self.item_features is not None:
+                    res['item_features'] = list(self.item_features[row.item_feature_idx, slate_pos])
+                if self.item_categorical is not None:
+                    res['item_categorical'] = list(self.item_categorical[row.item_feature_idx, slate_pos])
+                if self.user_categorical is not None:
+                    res['user_categorical'] = list(self.user_categorical[row.user_feature_idx, slate_pos])
+                if self.user_features is not None:
+                    res['user_features'] = list(self.user_features[row.user_feature_idx])
+                result.append(res)
+        return pd.DataFrame(result)
 
 class DummyData(RecommendationData):
     """
@@ -635,6 +658,7 @@ class OpenCDP(RecommendationData):
                     rec, clicks, cat_features = [], [], []
         super().__init__(
             recommendations = np.array(recommendations).astype(int),
+            item_categorical = np.array(category_features),
             responses = np.array(responses).astype(int),
             metadata = pd.DataFrame(metadata),
             **kwargs
