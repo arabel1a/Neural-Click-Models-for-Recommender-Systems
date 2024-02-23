@@ -3,14 +3,12 @@
 # Benchmark
  
 ## At first run
- 
-Before you start, you need to download the data available at Misha's Google Drive: [link](https://drive.google.com/drive/folders/17mP753jtLIq4jERKxbQWKjAP994FPT66?usp=drive_link).
- 
+  
 To work with datasets, you need to create `ContentWise` and `RL4RS` class instances which filter and prepare the data. It takes time, so they can be dumped to pickle for further fast loading. Do something like this:
 ```
-c = ContentWise('/home/arabella/Downloads/data/ContentWiseImpressions/data/ContentWiseImpressions/CW10M-CSV/')
+c = ContentWise('/home/USER/Downloads/data/ContentWiseImpressions/data/ContentWiseImpressions/CW10M-CSV/')
 c.dump('cw.pkl')
-r = RL4RS('/home/arabella/Downloads/data/rl4rs-dataset/', 'rl4rs_dataset_b_sl.csv')
+r = RL4RS('/home/USER/Downloads/data/rl4rs-dataset/', 'rl4rs_dataset_b_sl.csv')
 r.dump('rl4rs.pkl')
 ```
 Warning: It takes ~15 minutes on a 2018's laptop to process and requires ~24GB RAM in total for both datasets.
